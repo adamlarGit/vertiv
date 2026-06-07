@@ -1,0 +1,25 @@
+__pycache__/
+*.py[cod]
+
+.scratch/
+OUTPUT/
+
+# Large/raw working folders are excluded from source control by default.
+OTHERS/
+RAW DATA/
+TEST SHEET/
+
+# Keep only the active automation inputs unless explicitly needed.
+EXCEL/*
+!EXCEL/data.xlsx
+
+TEMPLATE/*
+!TEMPLATE/TEMPLATE.docx
+
+LIST.xlsx
+TEMPLATE.xlsx
+
+# Microsoft Office lock/temp files.
+~$*
+*.tmp.docx
+*.word_merge_working.docx
