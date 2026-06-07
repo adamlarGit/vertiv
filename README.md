@@ -11,10 +11,20 @@ python generate_report.py
 Default output:
 
 ```text
-OUTPUT/thermal_report.docx
+OUTPUT/thermal_report_part_01.docx
+OUTPUT/thermal_report_part_02.docx
+...
 ```
 
-The default merge engine uses Microsoft Word COM automation because FLIR Tools+ objects do not survive the pure Python DOCX merge as analyzable objects.
+The script splits merged reports into 10-page chunks by default. With the current 43-row workbook, it generates five files: 10 + 10 + 10 + 10 + 3 pages.
+
+Microsoft Word COM automation is used for merging because FLIR Tools+ objects do not survive pure Python DOCX merging as analyzable objects.
+
+To change the chunk size:
+
+```powershell
+python generate_report.py --chunk-size 5
+```
 
 ## Inputs
 
@@ -35,4 +45,4 @@ If those columns are later added to Excel, non-blank Excel values override the c
 pip install -r requirements.txt
 ```
 
-Microsoft Word must be installed for the default `--merge-engine word` mode.
+Microsoft Word must be installed because page merging is performed through Word automation.

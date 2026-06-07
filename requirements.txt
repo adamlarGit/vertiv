@@ -1,5 +1,3 @@
 docxtpl
 openpyxl
 pywin32
-python-docx
-docxcompose

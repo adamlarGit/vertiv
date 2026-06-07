@@ -2,6 +2,7 @@ __pycache__/
 *.py[cod]
 
 .scratch/
+.serena/
 OUTPUT/
 
 # Large/raw working folders are excluded from source control by default.

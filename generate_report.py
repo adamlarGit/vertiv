@@ -2,13 +2,13 @@ from __future__ import annotations
 
 import argparse
 import shutil
-import re
+import warnings
 from datetime import date, datetime, time
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from typing import Any
-from zipfile import ZIP_DEFLATED, ZipFile
-from xml.etree import ElementTree as ET
+
+warnings.filterwarnings("ignore", message="pkg_resources is deprecated as an API.*", category=UserWarning)
 
 from docxtpl import DocxTemplate
 from openpyxl import load_workbook
@@ -18,6 +18,7 @@ ROOT = Path(__file__).resolve().parent
 DEFAULT_EXCEL = ROOT / "EXCEL" / "data.xlsx"
 DEFAULT_TEMPLATE = ROOT / "TEMPLATE" / "TEMPLATE.docx"
 DEFAULT_OUTPUT = ROOT / "OUTPUT" / "thermal_report.docx"
+DEFAULT_CHUNK_SIZE = 10
 
 # Temporary report-level defaults. If these headers are later added to Excel,
 # non-blank Excel values will override these constants row by row.
@@ -27,18 +28,6 @@ DEFAULT_CONSTANTS: dict[str, Any] = {
     "rating": "415V",
 }
 
-NS = {
-    "w": "http://schemas.openxmlformats.org/wordprocessingml/2006/main",
-    "r": "http://schemas.openxmlformats.org/officeDocument/2006/relationships",
-    "v": "urn:schemas-microsoft-com:vml",
-    "o": "urn:schemas-microsoft-com:office:office",
-    "rel": "http://schemas.openxmlformats.org/package/2006/relationships",
-}
-
-for prefix, uri in NS.items():
-    if prefix != "rel":
-        ET.register_namespace(prefix, uri)
-
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
@@ -46,7 +35,7 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--excel", type=Path, default=DEFAULT_EXCEL, help="Input Excel data file.")
     parser.add_argument("--template", type=Path, default=DEFAULT_TEMPLATE, help="One-page DOCX template.")
-    parser.add_argument("--output", type=Path, default=DEFAULT_OUTPUT, help="Final combined DOCX output.")
+    parser.add_argument("--output", type=Path, default=DEFAULT_OUTPUT, help="Base output path for chunked DOCX parts.")
     parser.add_argument("--sheet", default=None, help="Worksheet name. Defaults to the active sheet.")
     parser.add_argument(
         "--keep-pages",
@@ -54,12 +43,15 @@ def parse_args() -> argparse.Namespace:
         help="Keep intermediate rendered page DOCX files next to the final output for debugging.",
     )
     parser.add_argument(
-        "--merge-engine",
-        choices=("docxcompose", "word"),
-        default="word",
-        help="Merge rendered pages with docxcompose or Microsoft Word COM automation.",
+        "--chunk-size",
+        type=int,
+        default=DEFAULT_CHUNK_SIZE,
+        help="Maximum pages per merged output part.",
     )
-    return parser.parse_args()
+    args = parser.parse_args()
+    if args.chunk_size < 1:
+        parser.error("--chunk-size must be at least 1")
+    return args
 
 
 def format_value(header: str, value: Any) -> Any:
@@ -143,24 +135,6 @@ def render_page(template_path: Path, context: dict[str, Any], output_path: Path)
     template.save(output_path)
 
 
-def combine_pages(page_paths: list[Path], output_path: Path) -> None:
-    if not page_paths:
-        raise ValueError("No rendered pages to combine.")
-
-    from docx import Document
-    from docxcompose.composer import Composer
-
-    master = Document(str(page_paths[0]))
-    composer = Composer(master)
-
-    for page_path in page_paths[1:]:
-        master.add_page_break()
-        composer.append(Document(str(page_path)))
-
-    output_path.parent.mkdir(parents=True, exist_ok=True)
-    composer.save(str(output_path))
-
-
 def combine_pages_with_word(page_paths: list[Path], output_path: Path) -> None:
     if not page_paths:
         raise ValueError("No rendered pages to combine.")
@@ -174,6 +148,8 @@ def combine_pages_with_word(page_paths: list[Path], output_path: Path) -> None:
     master_path = output_path.parent / f"{output_path.stem}.word_merge_working.docx"
     if master_path.exists():
         master_path.unlink()
+    if output_path.exists():
+        output_path.unlink()
     shutil.copy2(page_paths[0], master_path)
 
     word = win32com.client.DispatchEx("Word.Application")
@@ -184,10 +160,24 @@ def combine_pages_with_word(page_paths: list[Path], output_path: Path) -> None:
     try:
         document = word.Documents.Open(str(master_path.resolve()), ReadOnly=False, AddToRecentFiles=False)
         for page_path in page_paths[1:]:
+            source_document = None
             insert_range = document.Range(document.Content.End - 1, document.Content.End - 1)
             insert_range.InsertBreak(7)  # wdPageBreak
             insert_range = document.Range(document.Content.End - 1, document.Content.End - 1)
-            insert_range.InsertFile(str(page_path.resolve()))
+            try:
+                source_document = word.Documents.Open(
+                    str(page_path.resolve()),
+                    ReadOnly=True,
+                    AddToRecentFiles=False,
+                )
+                source_document.Content.Copy()
+                insert_range.Paste()
+            finally:
+                if source_document is not None:
+                    try:
+                        source_document.Close(SaveChanges=False)
+                    except Exception:
+                        pass
 
         document.SaveAs2(str(output_path.resolve()), FileFormat=12)  # wdFormatXMLDocument
     finally:
@@ -208,92 +198,28 @@ def combine_pages_with_word(page_paths: list[Path], output_path: Path) -> None:
         raise RuntimeError(f"Word merge did not create a valid output file: {output_path}")
 
 
-def make_flir_objects_independent(docx_path: Path) -> None:
-    """Give every copied FLIR placeholder its own field names, shape ID, and WMF part.
+def output_part_path(output_path: Path, part_number: int) -> Path:
+    return output_path.with_name(f"{output_path.stem}_part_{part_number:02d}{output_path.suffix}")
 
-    Word's manual copy/paste behavior creates unique VML object identities per page.
-    docxcompose keeps repeated source relationships compact, which is visually valid
-    but risky for FLIR Tools+ because multiple pages can point to the same field/media
-    slot. This post-process makes each page-level placeholder independent again.
-    """
 
-    with ZipFile(docx_path, "r") as source:
-        entries = {name: source.read(name) for name in source.namelist()}
+def clear_existing_parts(output_path: Path) -> None:
+    for existing_part in output_path.parent.glob(f"{output_path.stem}_part_*.docx"):
+        existing_part.unlink()
 
-    document_xml = entries["word/document.xml"]
-    rels_xml = entries["word/_rels/document.xml.rels"]
-    document_root = ET.fromstring(document_xml)
-    rels_root = ET.fromstring(rels_xml)
 
-    # Keep FLIR DOCVARIABLE field names unique per report page/table.
-    tables = document_root.findall(".//w:tbl", NS)
-    for page_idx, table in enumerate(tables, start=1):
-        field_idx = 0
-        for instr_text in table.findall(".//w:instrText", NS):
-            text = instr_text.text or ""
-            if "DOCVARIABLE" not in text:
-                continue
-            field_idx += 1
-            field_name = f"_Fd{800000000 + (page_idx * 100) + field_idx}"
-            instr_text.text = re.sub(r"DOCVARIABLE\s+\S+", f"DOCVARIABLE {field_name}", text, count=1)
+def chunked(values: list[Path], chunk_size: int) -> list[list[Path]]:
+    return [values[idx : idx + chunk_size] for idx in range(0, len(values), chunk_size)]
 
-    # Keep VML shape IDs unique per FLIR placeholder object.
-    shapes = document_root.findall(".//v:shape", NS)
-    for shape_idx, shape in enumerate(shapes, start=1):
-        shape.set("id", f"_x0000_i{3000 + shape_idx}")
 
-    # Duplicate the VML preview WMF/media relationship per object, matching Word paste behavior.
-    relationships = list(rels_root)
-    rel_by_id = {rel.get("Id"): rel for rel in relationships}
-    used_rids = {rel.get("Id") for rel in relationships if rel.get("Id")}
-    next_rid = 1000
-
-    def next_relationship_id() -> str:
-        nonlocal next_rid
-        while f"rId{next_rid}" in used_rids:
-            next_rid += 1
-        rid = f"rId{next_rid}"
-        used_rids.add(rid)
-        next_rid += 1
-        return rid
-
-    image_nodes = document_root.findall(".//v:imagedata", NS)
-    for image_idx, image_node in enumerate(image_nodes, start=1):
-        old_rid = image_node.get(f"{{{NS['r']}}}id")
-        old_rel = rel_by_id.get(old_rid)
-        if old_rel is None:
-            continue
-
-        old_target = old_rel.get("Target")
-        old_type = old_rel.get("Type")
-        if not old_target or not old_type:
-            continue
-
-        old_media_path = f"word/{old_target}"
-        if old_media_path not in entries:
-            continue
-
-        extension = Path(old_target).suffix or ".wmf"
-        new_target = f"media/flir_slot_{image_idx:03d}{extension}"
-        new_media_path = f"word/{new_target}"
-        entries[new_media_path] = entries[old_media_path]
-
-        new_rid = next_relationship_id()
-        new_rel = ET.Element(f"{{{NS['rel']}}}Relationship")
-        new_rel.set("Id", new_rid)
-        new_rel.set("Type", old_type)
-        new_rel.set("Target", new_target)
-        rels_root.append(new_rel)
-        image_node.set(f"{{{NS['r']}}}id", new_rid)
-
-    entries["word/document.xml"] = ET.tostring(document_root, encoding="utf-8", xml_declaration=True)
-    entries["word/_rels/document.xml.rels"] = ET.tostring(rels_root, encoding="utf-8", xml_declaration=True)
-
-    temp_path = docx_path.with_suffix(".tmp.docx")
-    with ZipFile(temp_path, "w", ZIP_DEFLATED) as target:
-        for name, content in entries.items():
-            target.writestr(name, content)
-    temp_path.replace(docx_path)
+def combine_pages_in_chunks(page_paths: list[Path], output_path: Path, chunk_size: int) -> list[Path]:
+    clear_existing_parts(output_path)
+    chunks = chunked(page_paths, chunk_size)
+    output_paths = []
+    for part_number, chunk in enumerate(chunks, start=1):
+        part_path = output_part_path(output_path, part_number)
+        combine_pages_with_word(chunk, part_path)
+        output_paths.append(part_path)
+    return output_paths
 
 
 def generate_report(
@@ -302,8 +228,8 @@ def generate_report(
     output_path: Path,
     sheet_name: str | None,
     keep_pages: bool,
-    merge_engine: str,
-) -> None:
+    chunk_size: int,
+) -> list[Path]:
     rows = load_rows(excel_path, sheet_name)
     output_path.parent.mkdir(parents=True, exist_ok=True)
 
@@ -317,12 +243,7 @@ def generate_report(
             page_path = pages_dir / f"page_{idx:03d}.docx"
             render_page(template_path, build_context(row), page_path)
             page_paths.append(page_path)
-        if merge_engine == "word":
-            combine_pages_with_word(page_paths, output_path)
-        else:
-            combine_pages(page_paths, output_path)
-            make_flir_objects_independent(output_path)
-        return
+        return combine_pages_in_chunks(page_paths, output_path, chunk_size)
 
     with TemporaryDirectory(dir=output_path.parent) as temp_dir:
         temp_path = Path(temp_dir)
@@ -331,24 +252,22 @@ def generate_report(
             page_path = temp_path / f"page_{idx:03d}.docx"
             render_page(template_path, build_context(row), page_path)
             page_paths.append(page_path)
-        if merge_engine == "word":
-            combine_pages_with_word(page_paths, output_path)
-        else:
-            combine_pages(page_paths, output_path)
-            make_flir_objects_independent(output_path)
+        return combine_pages_in_chunks(page_paths, output_path, chunk_size)
 
 
 def main() -> None:
     args = parse_args()
-    generate_report(
+    output_paths = generate_report(
         excel_path=args.excel,
         template_path=args.template,
         output_path=args.output,
         sheet_name=args.sheet,
         keep_pages=args.keep_pages,
-        merge_engine=args.merge_engine,
+        chunk_size=args.chunk_size,
     )
-    print(f"Generated: {args.output}")
+    print("Generated:")
+    for output_path in output_paths:
+        print(f"- {output_path}")
 
 
 if __name__ == "__main__":
