@@ -60,16 +60,16 @@ def format_value(header: str, value: Any) -> Any:
 
     if isinstance(value, datetime):
         if header == "date":
-            return value.strftime("%d-%m-%Y")
+            return value.strftime("%d/%m/%Y")
         if header == "time":
-            return value.strftime("%H:%M")
+            return value.strftime("%H:%M:%S")
         return value.isoformat(sep=" ")
 
     if isinstance(value, date) and header == "date":
-        return value.strftime("%d-%m-%Y")
+        return value.strftime("%d/%m/%Y")
 
     if isinstance(value, time):
-        return value.strftime("%H:%M")
+        return value.strftime("%H:%M:%S")
 
     if header == "humidity" and isinstance(value, (int, float)):
         return f"{value:.0%}" if 0 <= value <= 1 else str(value)
