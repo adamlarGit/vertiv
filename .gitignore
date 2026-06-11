@@ -11,9 +11,6 @@ RAW DATA/
 TEST SHEET/
 
 # Keep only the active automation inputs unless explicitly needed.
-EXCEL/*
-!EXCEL/data.xlsx
-
 TEMPLATE/*
 !TEMPLATE/TEMPLATE.docx
 
