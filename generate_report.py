@@ -2,8 +2,9 @@ from __future__ import annotations
 
 import argparse
 import shutil
+import time
 import warnings
-from datetime import date, datetime, time
+from datetime import date, datetime, time as datetime_time
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from typing import Any
@@ -15,25 +16,17 @@ from openpyxl import load_workbook
 
 
 ROOT = Path(__file__).resolve().parent
-DEFAULT_EXCEL = ROOT / "EXCEL" / "data.xlsx"
+DEFAULT_EXCEL = ROOT / "EXCEL"
 DEFAULT_TEMPLATE = ROOT / "TEMPLATE" / "TEMPLATE.docx"
 DEFAULT_OUTPUT = ROOT / "OUTPUT" / "thermal_report.docx"
 DEFAULT_CHUNK_SIZE = 10
-
-# Temporary report-level defaults. If these headers are later added to Excel,
-# non-blank Excel values will override these constants row by row.
-DEFAULT_CONSTANTS: dict[str, Any] = {
-    "ptu.no": "PTU 09",
-    "model": "",
-    "rating": "415V",
-}
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Render one Word report page per Excel row, preserving the source DOCX page objects."
     )
-    parser.add_argument("--excel", type=Path, default=DEFAULT_EXCEL, help="Input Excel data file.")
+    parser.add_argument("--excel", type=Path, default=DEFAULT_EXCEL, help="Input Excel data file or directory containing data.xlsx files.")
     parser.add_argument("--template", type=Path, default=DEFAULT_TEMPLATE, help="One-page DOCX template.")
     parser.add_argument("--output", type=Path, default=DEFAULT_OUTPUT, help="Base output path for chunked DOCX parts.")
     parser.add_argument("--sheet", default=None, help="Worksheet name. Defaults to the active sheet.")
@@ -60,16 +53,24 @@ def format_value(header: str, value: Any) -> Any:
 
     if isinstance(value, datetime):
         if header == "date":
-            return value.strftime("%d-%m-%Y")
+            return value.strftime("%d/%m/%Y")
         if header == "time":
-            return value.strftime("%H:%M")
+            return value.strftime("%H:%M:%S")
         return value.isoformat(sep=" ")
 
     if isinstance(value, date) and header == "date":
-        return value.strftime("%d-%m-%Y")
+        return value.strftime("%d/%m/%Y")
 
-    if isinstance(value, time):
-        return value.strftime("%H:%M")
+    if isinstance(value, datetime_time):
+        return value.strftime("%H:%M:%S")
+
+    if header == "ambient":
+        if isinstance(value, (int, float)):
+            return f"{value:.1f}"
+        try:
+            return f"{float(value):.1f}"
+        except (TypeError, ValueError):
+            pass
 
     if header == "humidity" and isinstance(value, (int, float)):
         return f"{value:.0%}" if 0 <= value <= 1 else str(value)
@@ -92,9 +93,6 @@ def set_nested(context: dict[str, Any], dotted_key: str, value: Any) -> None:
 def build_context(row: dict[str, Any]) -> dict[str, Any]:
     context: dict[str, Any] = {}
 
-    for key, value in DEFAULT_CONSTANTS.items():
-        set_nested(context, key, value)
-
     for key, value in row.items():
         if key is None:
             continue
@@ -103,8 +101,6 @@ def build_context(row: dict[str, Any]) -> dict[str, Any]:
             continue
 
         formatted = format_value(normalized_key, value)
-        if formatted == "" and normalized_key in DEFAULT_CONSTANTS:
-            continue
         set_nested(context, normalized_key, formatted)
 
     return context
@@ -217,7 +213,11 @@ def combine_pages_in_chunks(page_paths: list[Path], output_path: Path, chunk_siz
     output_paths = []
     for part_number, chunk in enumerate(chunks, start=1):
         part_path = output_part_path(output_path, part_number)
+        start = time.perf_counter()
+        print(f"Compiling part {part_number}/{len(chunks)} ({len(chunk)} pages) into {part_path.name}...")
         combine_pages_with_word(chunk, part_path)
+        elapsed = time.perf_counter() - start
+        print(f"Finished part {part_number}/{len(chunks)} in {elapsed:.1f} seconds.")
         output_paths.append(part_path)
     return output_paths
 
@@ -257,17 +257,54 @@ def generate_report(
 
 def main() -> None:
     args = parse_args()
-    output_paths = generate_report(
-        excel_path=args.excel,
-        template_path=args.template,
-        output_path=args.output,
-        sheet_name=args.sheet,
-        keep_pages=args.keep_pages,
-        chunk_size=args.chunk_size,
-    )
-    print("Generated:")
-    for output_path in output_paths:
-        print(f"- {output_path}")
+    start = time.perf_counter()
+
+    if args.excel.is_dir():
+        print(f"Batch mode: searching for data.xlsx in {args.excel}...")
+        excel_files = sorted(args.excel.rglob("data.xlsx"))
+        if not excel_files:
+            print(f"No data.xlsx files found in {args.excel}")
+            return
+
+        print(f"Found {len(excel_files)} data files.")
+        all_output_paths = []
+        for excel_file in excel_files:
+            # Calculate relative path to mirror structure
+            rel_path = excel_file.relative_to(args.excel)
+            # Output folder mirrors the input folder
+            target_output_dir = args.output.parent / rel_path.parent
+            target_output_path = target_output_dir / args.output.name
+
+            print(f"\nProcessing: {excel_file}")
+            print(f"Target: {target_output_path}")
+
+            output_paths = generate_report(
+                excel_path=excel_file,
+                template_path=args.template,
+                output_path=target_output_path,
+                sheet_name=args.sheet,
+                keep_pages=args.keep_pages,
+                chunk_size=args.chunk_size,
+            )
+            all_output_paths.extend(output_paths)
+        
+        elapsed = time.perf_counter() - start
+        print(f"\nGenerated {len(all_output_paths)} parts in total.")
+        print(f"Total execution time: {elapsed:.1f} seconds.")
+    else:
+        output_paths = generate_report(
+            excel_path=args.excel,
+            template_path=args.template,
+            output_path=args.output,
+            sheet_name=args.sheet,
+            keep_pages=args.keep_pages,
+            chunk_size=args.chunk_size,
+        )
+        elapsed = time.perf_counter() - start
+        print("Generated:")
+        for output_path in output_paths:
+            print(f"- {output_path}")
+        print(f"Total execution time: {elapsed:.1f} seconds.")
 
 
 if __name__ == "__main__":
